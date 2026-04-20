@@ -9,38 +9,95 @@ import {
 
 const API_URL = import.meta.env.VITE_API_URL || "/api";
 
-const doctors = [
-  { id: "doc001", name: "Dr. Hamza", fee: 1200 },
-  { id: "doc002", name: "Dr. Areeba", fee: 1500 }
-];
+const upsertDoctorAvailability = (availability, date, slots) => {
+  const nextAvailability = Array.isArray(availability) ? [...availability] : [];
+  const existingIndex = nextAvailability.findIndex((entry) => entry.date === date);
 
-const initialAvailability = {
-  doc001: {
-    "2026-04-20": ["10:00", "11:00", "12:00"],
-    "2026-04-21": ["09:00", "10:30"]
-  },
-  doc002: {
-    "2026-04-20": ["13:00", "14:00"],
-    "2026-04-21": ["15:00", "16:00"]
+  if (existingIndex >= 0) {
+    nextAvailability[existingIndex] = {
+      ...nextAvailability[existingIndex],
+      slots
+    };
+    return nextAvailability;
   }
+
+  return [...nextAvailability, { date, slots }];
 };
 
+const removeBookedSlot = (availability, date, time) =>
+  (Array.isArray(availability) ? availability : []).map((entry) =>
+    entry.date === date
+      ? { ...entry, slots: (entry.slots || []).filter((slot) => slot !== time) }
+      : entry
+  );
+
 export default function BookingPage() {
-  const [form, setForm] = useState({ doctorId: doctors[0].id, date: "", time: "" });
-  const [availability, setAvailability] = useState(initialAvailability);
+  const [form, setForm] = useState({ doctorId: "", date: "", time: "" });
+  const [doctors, setDoctors] = useState([]);
+  const [loadingDoctors, setLoadingDoctors] = useState(true);
   const [statusMessage, setStatusMessage] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const selectedDoctor = useMemo(
-    () => doctors.find((doctor) => doctor.id === form.doctorId),
-    [form.doctorId]
+    () => doctors.find((doctor) => doctor._id === form.doctorId) || null,
+    [doctors, form.doctorId]
   );
 
+  const availableDates = useMemo(() => selectedDoctor?.availability || [], [selectedDoctor]);
+
   const availableSlots = useMemo(() => {
-    if (!form.date) return [];
-    return availability[form.doctorId]?.[form.date] || [];
-  }, [availability, form.date, form.doctorId]);
+    if (!selectedDoctor || !form.date) return [];
+    return selectedDoctor.availability?.find((entry) => entry.date === form.date)?.slots || [];
+  }, [selectedDoctor, form.date]);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    const loadDoctors = async () => {
+      try {
+        setLoadingDoctors(true);
+        const response = await fetch(`${API_URL}/doctor`);
+        const data = await response.json();
+
+        if (!response.ok) {
+          throw new Error(data.msg || "Failed to load doctors");
+        }
+
+        const doctorList = Array.isArray(data.doctors) ? data.doctors : [];
+
+        if (!isMounted) {
+          return;
+        }
+
+        setDoctors(doctorList);
+
+        setForm((prev) => {
+          const matchedDoctor = doctorList.find((doctor) => doctor._id === prev.doctorId);
+
+          return {
+            doctorId: matchedDoctor?._id || doctorList[0]?._id || "",
+            date: matchedDoctor && prev.date ? prev.date : "",
+            time: matchedDoctor && prev.time ? prev.time : ""
+          };
+        });
+      } catch (error) {
+        if (isMounted) {
+          setErrorMessage("Unable to load doctors right now. Please try again later.");
+        }
+      } finally {
+        if (isMounted) {
+          setLoadingDoctors(false);
+        }
+      }
+    };
+
+    loadDoctors();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   useEffect(() => {
     connectSocket();
@@ -50,13 +107,20 @@ export default function BookingPage() {
         return;
       }
 
-      setAvailability((prev) => ({
-        ...prev,
-        [payload.doctorId]: {
-          ...(prev[payload.doctorId] || {}),
-          [payload.date]: payload.availableSlots
-        }
-      }));
+      setDoctors((prev) =>
+        prev.map((doctor) =>
+          doctor._id === payload.doctorId
+            ? {
+              ...doctor,
+              availability: upsertDoctorAvailability(
+                doctor.availability,
+                payload.date,
+                payload.availableSlots
+              )
+            }
+            : doctor
+        )
+      );
 
       if (payload.doctorId === form.doctorId && payload.date === form.date) {
         setStatusMessage(`Live update: slots refreshed for ${payload.date}`);
@@ -69,18 +133,16 @@ export default function BookingPage() {
         return;
       }
 
-      setAvailability((prev) => {
-        const existingSlots = prev[payload.doctorId]?.[payload.date] || [];
-        if (existingSlots.length === 0) return prev;
-
-        return {
-          ...prev,
-          [payload.doctorId]: {
-            ...(prev[payload.doctorId] || {}),
-            [payload.date]: existingSlots.filter((slot) => slot !== payload.time)
-          }
-        };
-      });
+      setDoctors((prev) =>
+        prev.map((doctor) =>
+          doctor._id === payload.doctorId
+            ? {
+              ...doctor,
+              availability: removeBookedSlot(doctor.availability, payload.date, payload.time)
+            }
+            : doctor
+        )
+      );
 
       if (payload.doctorId === form.doctorId && payload.date === form.date) {
         setStatusMessage(`Slot ${payload.time} was booked by another user.`);
@@ -127,6 +189,11 @@ export default function BookingPage() {
       return;
     }
 
+    if (!selectedDoctor) {
+      setErrorMessage("Please select a doctor first.");
+      return;
+    }
+
     const token = localStorage.getItem("token");
     if (!token) {
       setErrorMessage("Login required. No token found in localStorage.");
@@ -142,7 +209,7 @@ export default function BookingPage() {
           Authorization: `Bearer ${token}`
         },
         body: JSON.stringify({
-          doctorId: form.doctorId,
+          doctorId: selectedDoctor._id,
           date: form.date,
           time: form.time
         })
@@ -154,16 +221,16 @@ export default function BookingPage() {
         return;
       }
 
-      setAvailability((prev) => {
-        const existingSlots = prev[form.doctorId]?.[form.date] || [];
-        return {
-          ...prev,
-          [form.doctorId]: {
-            ...(prev[form.doctorId] || {}),
-            [form.date]: existingSlots.filter((slot) => slot !== form.time)
-          }
-        };
-      });
+      setDoctors((prev) =>
+        prev.map((doctor) =>
+          doctor._id === selectedDoctor._id
+            ? {
+              ...doctor,
+              availability: removeBookedSlot(doctor.availability, form.date, form.time)
+            }
+            : doctor
+        )
+      );
 
       setStatusMessage("Appointment booked successfully.");
       setForm((prev) => ({ ...prev, time: "" }));
@@ -187,27 +254,38 @@ export default function BookingPage() {
           {/* Doctor Selection */}
           <div className="mb-8">
             <h2 className="text-xl font-bold mb-4">🏥 Select a Doctor</h2>
+            {loadingDoctors && (
+              <div className="rounded-lg border border-blue-200 bg-blue-50 p-4 text-blue-700">
+                Loading doctors from the backend...
+              </div>
+            )}
+
+            {!loadingDoctors && doctors.length === 0 && (
+              <div className="rounded-lg border border-amber-200 bg-amber-50 p-4 text-amber-700">
+                No verified doctors are available yet.
+              </div>
+            )}
+
             <div className="grid md:grid-cols-2 gap-4">
               {doctors.map((doctor) => (
                 <button
-                  key={doctor.id}
+                  key={doctor._id}
                   type="button"
                   onClick={() => {
-                    onChange({ target: { name: "doctorId", value: doctor.id } });
+                    onChange({ target: { name: "doctorId", value: doctor._id } });
                   }}
-                  className={`p-4 rounded-xl border-2 transition-all text-left ${
-                    form.doctorId === doctor.id
-                      ? "border-purple-600 bg-purple-50"
-                      : "border-gray-200 bg-white hover:border-purple-300"
-                  }`}
+                  className={`p-4 rounded-xl border-2 transition-all text-left ${form.doctorId === doctor._id
+                    ? "border-purple-600 bg-purple-50"
+                    : "border-gray-200 bg-white hover:border-purple-300"
+                    }`}
                 >
                   <div className="text-3xl mb-2">👨‍⚕️</div>
-                  <h3 className="font-bold text-lg text-gray-900">{doctor.name}</h3>
-                  <p className="text-purple-600 font-semibold">Rs. {doctor.fee}/consultation</p>
-                  <div className="flex items-center gap-1 mt-2">
-                    <span className="text-yellow-400">⭐</span>
-                    <span className="text-sm text-gray-600">4.8 (1240 patients)</span>
-                  </div>
+                  <h3 className="font-bold text-lg text-gray-900">Dr. {doctor.name}</h3>
+                  <p className="text-purple-600 font-semibold">Rs. {doctor.price}/consultation</p>
+                  <p className="mt-2 text-sm text-gray-600">{doctor.specialization}</p>
+                  <p className="mt-1 text-xs text-gray-500">
+                    {doctor.isOnline ? "Online now" : "Currently offline"}
+                  </p>
                 </button>
               ))}
             </div>
@@ -228,6 +306,27 @@ export default function BookingPage() {
               <p className="text-sm text-gray-600 mt-2">
                 📅 Selected: <span className="font-semibold">{new Date(form.date).toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}</span>
               </p>
+            )}
+
+            {availableDates.length > 0 && (
+              <div className="mt-4 flex flex-wrap gap-2">
+                {availableDates.map((entry) => (
+                  <button
+                    key={entry.date}
+                    type="button"
+                    onClick={() =>
+                      setForm((prev) => ({
+                        ...prev,
+                        date: entry.date,
+                        time: ""
+                      }))
+                    }
+                    className="rounded-full border border-purple-200 bg-purple-50 px-3 py-1 text-sm font-medium text-purple-700 hover:bg-purple-100"
+                  >
+                    {entry.date}
+                  </button>
+                ))}
+              </div>
             )}
           </div>
 
@@ -253,11 +352,10 @@ export default function BookingPage() {
                     key={slot}
                     type="button"
                     onClick={() => setForm((prev) => ({ ...prev, time: slot }))}
-                    className={`py-3 px-4 rounded-lg font-semibold transition-all ${
-                      form.time === slot
-                        ? "bg-purple-600 text-white shadow-lg scale-105"
-                        : "bg-gray-100 text-gray-700 hover:bg-gray-200"
-                    }`}
+                    className={`py-3 px-4 rounded-lg font-semibold transition-all ${form.time === slot
+                      ? "bg-purple-600 text-white shadow-lg scale-105"
+                      : "bg-gray-100 text-gray-700 hover:bg-gray-200"
+                      }`}
                   >
                     {slot}
                   </button>
@@ -270,7 +368,7 @@ export default function BookingPage() {
           <div className="p-4 bg-purple-50 border border-purple-200 rounded-lg">
             <div className="flex items-center justify-between">
               <span className="font-semibold text-gray-900">Consultation Fee:</span>
-              <span className="text-2xl font-bold text-purple-600">Rs. {selectedDoctor?.fee}</span>
+              <span className="text-2xl font-bold text-purple-600">Rs. {selectedDoctor?.price || 0}</span>
             </div>
           </div>
         </div>
@@ -282,7 +380,7 @@ export default function BookingPage() {
             <div className="space-y-3">
               <div className="flex justify-between items-center py-2 border-b">
                 <span className="text-gray-600">Doctor:</span>
-                <span className="font-semibold">{selectedDoctor?.name}</span>
+                <span className="font-semibold">{selectedDoctor ? `Dr. ${selectedDoctor.name}` : "N/A"}</span>
               </div>
               <div className="flex justify-between items-center py-2 border-b">
                 <span className="text-gray-600">Date:</span>
@@ -314,12 +412,11 @@ export default function BookingPage() {
         {/* Submit Button */}
         <button
           type="submit"
-          disabled={isSubmitting || !form.date || !form.time}
-          className={`w-full py-4 px-6 rounded-xl font-bold text-lg text-white transition-all ${
-            isSubmitting || !form.date || !form.time
-              ? "bg-gray-400 cursor-not-allowed opacity-60"
-              : "bg-gradient-to-r from-purple-600 to-blue-600 hover:shadow-xl hover:scale-105"
-          }`}
+          disabled={isSubmitting || loadingDoctors || !selectedDoctor || !form.date || !form.time}
+          className={`w-full py-4 px-6 rounded-xl font-bold text-lg text-white transition-all ${isSubmitting || loadingDoctors || !selectedDoctor || !form.date || !form.time
+            ? "bg-gray-400 cursor-not-allowed opacity-60"
+            : "bg-gradient-to-r from-purple-600 to-blue-600 hover:shadow-xl hover:scale-105"
+            }`}
         >
           {isSubmitting ? (
             <div className="flex items-center justify-center gap-2">
